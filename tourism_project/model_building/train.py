@@ -1,81 +1,112 @@
-"""Train + tune an XGBoost model, track everything in MLflow, save the best model for deployment."""
+# for data manipulation
 import os
-import joblib
-import mlflow
 import pandas as pd
 from sklearn.compose import make_column_transformer
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import (accuracy_score, classification_report, f1_score,
-                             precision_score, recall_score, roc_auc_score)
-from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from xgboost import XGBClassifier
-
-MODEL_DIR = "tourism_project/deployment"
-MODEL_PATH = os.path.join(MODEL_DIR, "best_tourism_model_v1.joblib")
-os.makedirs(MODEL_DIR, exist_ok=True)
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+# for model training, tuning, and evaluation
+import xgboost as xgb
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import classification_report, roc_auc_score
+# for model serialization and experiment tracking
+import joblib
+import mlflow
 
 # The workflow starts an MLflow server on port 5000 before this script runs
 mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
-mlflow.set_experiment("tourism-wellness-package")
+mlflow.set_experiment("tourism-training-experiment")
 
-# --- Load the splits produced by the data-prep job ---
-Xtrain, Xtest = pd.read_csv("Xtrain.csv"), pd.read_csv("Xtest.csv")
-ytrain, ytest = pd.read_csv("ytrain.csv").squeeze(), pd.read_csv("ytest.csv").squeeze()
+# Xtrain/Xtest/ytrain/ytest are downloaded from the previous job's artifact
+Xtrain = pd.read_csv("Xtrain.csv")
+Xtest  = pd.read_csv("Xtest.csv")
+ytrain = pd.read_csv("ytrain.csv").squeeze()
+ytest  = pd.read_csv("ytest.csv").squeeze()
 
-num_cols = Xtrain.select_dtypes("number").columns.tolist()
-cat_cols = Xtrain.select_dtypes(exclude="number").columns.tolist()
+# Numeric features are imputed + scaled, categorical features are imputed + one-hot encoded
+numeric_features = Xtrain.select_dtypes("number").columns.tolist()
+categorical_features = Xtrain.select_dtypes(exclude="number").columns.tolist()
 
+# Set the class weight to handle class imbalance (non-buyers : buyers)
+class_weight = ytrain.value_counts()[0] / ytrain.value_counts()[1]
+
+# Define the preprocessing steps
 preprocessor = make_column_transformer(
-    (make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), num_cols),
+    (make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), numeric_features),
     (make_pipeline(SimpleImputer(strategy="most_frequent"),
-                   OneHotEncoder(handle_unknown="ignore")), cat_cols),
+                   OneHotEncoder(handle_unknown="ignore")), categorical_features),
 )
 
-# --- Model + hyperparameter grid ---
-class_ratio = (ytrain == 0).sum() / (ytrain == 1).sum()   # handles the class imbalance
-xgb = XGBClassifier(scale_pos_weight=class_ratio, eval_metric="logloss", random_state=42)
-pipeline = make_pipeline(preprocessor, xgb)
+# Define base XGBoost model
+xgb_model = xgb.XGBClassifier(scale_pos_weight=class_weight, eval_metric="logloss", random_state=42)
 
+# Hyperparameter grid: 3x3x3x2x2 = 108 combinations (x3 CV folds), still quick on GitHub Actions
 param_grid = {
-    "xgbclassifier__n_estimators": [100, 300],
-    "xgbclassifier__max_depth": [3, 6],
-    "xgbclassifier__learning_rate": [0.1, 0.3],
+    "xgbclassifier__n_estimators": [100, 200, 300],
+    "xgbclassifier__max_depth": [3, 5, 7],
+    "xgbclassifier__learning_rate": [0.05, 0.1, 0.3],
+    "xgbclassifier__colsample_bytree": [0.5, 0.8],
+    "xgbclassifier__reg_lambda": [1, 5],
 }
 
-with mlflow.start_run(run_name="xgboost_grid_search"):
-    grid = GridSearchCV(pipeline, param_grid, cv=3, scoring="f1", n_jobs=-1)
-    grid.fit(Xtrain, ytrain)
+# Model pipeline
+model_pipeline = make_pipeline(preprocessor, xgb_model)
 
-    # Log every parameter combination as a nested run
-    results = grid.cv_results_
-    for i, params in enumerate(results["params"]):
-        with mlflow.start_run(nested=True, run_name=f"combo_{i}"):
-            mlflow.log_params({k.split("__")[-1]: v for k, v in params.items()})
-            mlflow.log_metric("mean_cv_f1", results["mean_test_score"][i])
-            mlflow.log_metric("std_cv_f1", results["std_test_score"][i])
+# Start MLflow run
+with mlflow.start_run():
+    # Hyperparameter tuning (F1 balances catching buyers against wasted calls)
+    grid_search = GridSearchCV(model_pipeline, param_grid, cv=3, scoring="f1", n_jobs=-1)
+    grid_search.fit(Xtrain, ytrain)
 
-    best_model = grid.best_estimator_
-    mlflow.log_params({f"best_{k.split('__')[-1]}": v for k, v in grid.best_params_.items()})
-    mlflow.log_metric("best_cv_f1", grid.best_score_)
+    # Log all parameter combinations and their mean CV scores
+    results = grid_search.cv_results_
+    for i in range(len(results["params"])):
+        param_set = results["params"][i]
+        mean_score = results["mean_test_score"][i]
+        std_score = results["std_test_score"][i]
 
-    # --- Evaluate the best model ---
-    for split, X_, y_ in [("train", Xtrain, ytrain), ("test", Xtest, ytest)]:
-        pred = best_model.predict(X_)
-        proba = best_model.predict_proba(X_)[:, 1]
-        mlflow.log_metrics({
-            f"{split}_accuracy": accuracy_score(y_, pred),
-            f"{split}_precision": precision_score(y_, pred),
-            f"{split}_recall": recall_score(y_, pred),
-            f"{split}_f1": f1_score(y_, pred),
-            f"{split}_roc_auc": roc_auc_score(y_, proba),
-        })
+        # Log each combination as a separate (nested) MLflow run
+        with mlflow.start_run(nested=True):
+            mlflow.log_params(param_set)
+            mlflow.log_metric("mean_test_score", mean_score)
+            mlflow.log_metric("std_test_score", std_score)
 
-    print("Best parameters:", grid.best_params_)
-    print("\nTest set classification report:")
-    print(classification_report(ytest, best_model.predict(Xtest), target_names=["No purchase", "Purchase"]))
+    # Log best parameters separately in the main run
+    mlflow.log_params({f"best_{k}": v for k, v in grid_search.best_params_.items()})
 
-# --- Save the model into the deployment folder; the workflow commits it to the repo ---
-joblib.dump(best_model, MODEL_PATH)
-print("Model saved to", MODEL_PATH)
+    # Store and evaluate the best model
+    best_model = grid_search.best_estimator_
+    print("Best params:", grid_search.best_params_)
+
+    classification_threshold = 0.45
+
+    y_pred_train_proba = best_model.predict_proba(Xtrain)[:, 1]
+    y_pred_train = (y_pred_train_proba >= classification_threshold).astype(int)
+
+    y_pred_test_proba = best_model.predict_proba(Xtest)[:, 1]
+    y_pred_test = (y_pred_test_proba >= classification_threshold).astype(int)
+
+    train_report = classification_report(ytrain, y_pred_train, output_dict=True)
+    test_report = classification_report(ytest, y_pred_test, output_dict=True)
+    print(classification_report(ytest, y_pred_test, target_names=["No purchase", "Purchase"]))
+
+    # Log the metrics for the best model
+    mlflow.log_metrics({
+        "train_accuracy": train_report["accuracy"],
+        "train_precision": train_report["1"]["precision"],
+        "train_recall": train_report["1"]["recall"],
+        "train_f1-score": train_report["1"]["f1-score"],
+        "test_accuracy": test_report["accuracy"],
+        "test_precision": test_report["1"]["precision"],
+        "test_recall": test_report["1"]["recall"],
+        "test_f1-score": test_report["1"]["f1-score"],
+        "test_roc_auc": roc_auc_score(ytest, y_pred_test_proba),
+    })
+
+    # Save next to app.py so the Streamlit app can load it directly,
+    # and log it as an MLflow artifact for traceability
+    os.makedirs("tourism_project/deployment", exist_ok=True)
+    model_path = "tourism_project/deployment/best_tourism_model_v1.joblib"
+    joblib.dump(best_model, model_path)
+    mlflow.log_artifact(model_path, artifact_path="model")
+    print(f"Model saved to {model_path}")
